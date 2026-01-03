@@ -205,3 +205,62 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# =============================================================================
+# MLOps Security - Additional patterns for ML projects
+# =============================================================================
+
+# Trained ML Models (may contain embedded training data)
+*.pkl
+*.joblib
+*.h5
+*.keras
+*.pt
+*.pth
+*.onnx
+*.pb
+saved_models/
+models/
+checkpoints/
+
+# Data files (may contain sensitive information)
+data/*.csv
+data/*.parquet
+data/*.json
+data/*.xlsx
+!data/__init__.py
+!data/.gitkeep
+
+# Credentials and Service Accounts
+*credentials*.json
+*service-account*.json
+*serviceaccount*.json
+secrets/
+.secrets/
+
+# Private keys and certificates
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.jks
+
+# Cloud provider configs
+.gcloud/
+.aws/
+.azure/
+
+# MLflow artifacts
+mlruns/
+mlartifacts/
+
+# Weights & Biases
+wandb/
+
+# DVC (Data Version Control)
+/dvc.lock
+
+# Experiment tracking
+experiments/
+runs/
