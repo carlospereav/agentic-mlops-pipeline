@@ -265,6 +265,10 @@ def print_pipeline_results(state: dict[str, Any]) -> None:
     print("\n" + "=" * 70)
 
 
+# Default dataset path
+DEFAULT_DATASET = "data/iris.csv"
+
+
 # Entry point
 if __name__ == "__main__":
     import sys
@@ -272,16 +276,15 @@ if __name__ == "__main__":
     # Print graph structure
     print_graph_ascii()
     
-    # Check for data path argument
+    # Use provided path or default to Iris dataset
     if len(sys.argv) > 1:
         data_file = sys.argv[1]
-        print(f"Running pipeline on: {data_file}")
-        print("-" * 50)
-        
-        result = run_pipeline(data_file)
-        print_pipeline_results(result)
     else:
-        print("Usage: python main.py <path_to_csv>")
-        print("\nExample:")
-        print("  python main.py data/dataset.csv")
-        print("\nNote: CSV file must be in allowed directories (data/, datasets/, input/)")
+        data_file = DEFAULT_DATASET
+        print(f"No dataset specified. Using default: {DEFAULT_DATASET}")
+    
+    print(f"Running pipeline on: {data_file}")
+    print("-" * 50)
+    
+    result = run_pipeline(data_file)
+    print_pipeline_results(result)
