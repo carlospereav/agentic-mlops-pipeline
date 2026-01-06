@@ -1,9 +1,12 @@
 """
 Mathematician Agent (The Validator) for the MLOps pipeline.
-Responsible for model training and validation.
+Responsible for:
+- Train/test split (for grid search flexibility)
+- Model training with GridSearchCV
+- Rigorous validation
 
-NOTE: This agent only calculates metrics and saves the model.
-It does NOT make flow decisions - that's handled by conditional edges in main.py.
+NOTE: This agent controls the split to enable grid search, cross-validation, etc.
+Flow decisions are made by conditional edges in main.py, not here.
 """
 
 from pathlib import Path
@@ -20,6 +23,7 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
 )
+from sklearn.model_selection import GridSearchCV, train_test_split
 
 from state import AgentState
 
@@ -27,19 +31,25 @@ from state import AgentState
 # Directory for saving models
 MODELS_DIR = Path(__file__).parent.parent / "models"
 
+# Grid search parameters for RandomForest
+RF_PARAM_GRID = {
+    "n_estimators": [50, 100],
+    "max_depth": [5, 10, None],
+    "min_samples_split": [2, 5],
+}
+
 
 def mathematician_node(state: AgentState) -> dict[str, Any]:
     """
     Mathematician agent node - LangGraph compatible.
     
-    Trains a RandomForest model and calculates validation metrics.
-    Saves the trained model as .pkl file.
-    
-    IMPORTANT: This agent only updates metrics and model state.
-    Flow decisions (approve/reject) are made by conditional edges.
+    1. Receives cleaned data from Data Engineer
+    2. Splits into train/test (controls split for grid search)
+    3. Trains RandomForest with GridSearchCV
+    4. Evaluates and saves model as .pkl
     
     Args:
-        state: Current AgentState with training data from Data Engineer.
+        state: Current AgentState with cleaned data.
         
     Returns:
         Updated state with model, metrics, and model_path.
@@ -47,76 +57,92 @@ def mathematician_node(state: AgentState) -> dict[str, Any]:
     messages = list(state.get("messages", []))
     
     try:
-        # Retrieve training data from state
-        X_train = state.get("_X_train", [])
-        X_test = state.get("_X_test", [])
-        y_train = state.get("_y_train", [])
-        y_test = state.get("_y_test", [])
+        # Get cleaned data from Data Engineer
+        cleaned_data = state.get("_cleaned_data", [])
         target_column = state.get("_target_column", "target")
+        feature_columns = state.get("_feature_columns", [])
         
-        if not X_train or not y_train:
-            raise ValueError("No training data available. Data Engineer must run first.")
+        if not cleaned_data:
+            raise ValueError("No cleaned data available. Data Engineer must run first.")
         
         messages.append(AIMessage(
-            content=f"[Mathematician] Received {len(X_train)} training samples, "
-                   f"{len(X_test)} test samples. Starting model training..."
+            content=f"[Mathematician] Received {len(cleaned_data)} samples. "
+                   f"Starting train/test split and model training..."
         ))
         
-        # Convert to DataFrames
-        X_train_df = pd.DataFrame(X_train)
-        X_test_df = pd.DataFrame(X_test)
-        y_train_series = pd.Series(y_train)
-        y_test_series = pd.Series(y_test)
+        # Convert to DataFrame
+        df = pd.DataFrame(cleaned_data)
+        X = df[feature_columns]
+        y = df[target_column]
         
-        # Train RandomForest classifier
-        model = RandomForestClassifier(
-            n_estimators=100,
-            max_depth=10,
-            random_state=42,
-            n_jobs=-1,
+        # Step 1: Train/test split (Mathematician controls this)
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
         )
-        model.fit(X_train_df, y_train_series)
         
         messages.append(AIMessage(
-            content=f"[Mathematician] RandomForest trained. "
-                   f"Features: {X_train_df.shape[1]}, "
-                   f"Classes: {model.classes_.tolist()}"
+            content=f"[Mathematician] Split: Train={len(X_train)}, Test={len(X_test)} "
+                   f"(stratified by target)"
         ))
         
-        # Calculate predictions
-        y_pred = model.predict(X_test_df)
+        # Step 2: GridSearchCV for hyperparameter tuning
+        messages.append(AIMessage(
+            content=f"[Mathematician] Running GridSearchCV with params: {list(RF_PARAM_GRID.keys())}"
+        ))
         
-        # Calculate metrics
-        metrics = _calculate_metrics(y_test_series, y_pred)
+        base_model = RandomForestClassifier(random_state=42, n_jobs=-1)
+        grid_search = GridSearchCV(
+            base_model,
+            RF_PARAM_GRID,
+            cv=3,
+            scoring="accuracy",
+            n_jobs=-1,
+            verbose=0,
+        )
+        grid_search.fit(X_train, y_train)
+        
+        # Best model from grid search
+        model = grid_search.best_estimator_
+        best_params = grid_search.best_params_
+        cv_score = grid_search.best_score_
         
         messages.append(AIMessage(
-            content=f"[Mathematician] Validation metrics: "
+            content=f"[Mathematician] GridSearch complete. "
+                   f"Best params: {best_params}, CV score: {cv_score:.4f}"
+        ))
+        
+        # Step 3: Evaluate on test set
+        y_pred = model.predict(X_test)
+        metrics = _calculate_metrics(y_test, y_pred)
+        
+        messages.append(AIMessage(
+            content=f"[Mathematician] Test metrics: "
                    f"Accuracy={metrics['accuracy']:.4f}, "
                    f"Precision={metrics['precision']:.4f}, "
                    f"Recall={metrics['recall']:.4f}, "
                    f"F1={metrics['f1_score']:.4f}"
         ))
         
-        # Save model as .pkl
-        model_path = _save_model_pkl(model, "trained_model", metrics)
+        # Step 4: Save model as .pkl
+        model_path = _save_model_pkl(model, "trained_model", metrics, best_params)
         
         messages.append(AIMessage(
             content=f"[Mathematician] Model saved to: {model_path}"
         ))
         
-        # Return updated state - NO flow decisions here
+        # Return updated state
         return {
             "messages": messages,
             "model": model,
             "model_path": model_path,
             "metrics": metrics,
             "status": "trained",
-            # Preserve internal data for potential retry
-            "_X_train": X_train,
-            "_X_test": X_test,
-            "_y_train": y_train,
-            "_y_test": y_test,
+            # Preserve data for potential retry
+            "_cleaned_data": cleaned_data,
             "_target_column": target_column,
+            "_feature_columns": feature_columns,
+            "_best_params": best_params,
+            "_cv_score": cv_score,
         }
         
     except Exception as e:
@@ -132,17 +158,7 @@ def mathematician_node(state: AgentState) -> dict[str, Any]:
 
 
 def _calculate_metrics(y_true: pd.Series, y_pred) -> dict[str, float]:
-    """
-    Calculate classification metrics.
-    
-    Args:
-        y_true: True labels.
-        y_pred: Predicted labels.
-        
-    Returns:
-        Dictionary with accuracy, precision, recall, f1_score, and mae.
-    """
-    # Determine if binary or multiclass
+    """Calculate classification metrics."""
     n_classes = len(set(y_true))
     average = "binary" if n_classes == 2 else "weighted"
     
@@ -151,8 +167,6 @@ def _calculate_metrics(y_true: pd.Series, y_pred) -> dict[str, float]:
     recall = recall_score(y_true, y_pred, average=average, zero_division=0)
     f1 = f1_score(y_true, y_pred, average=average, zero_division=0)
     
-    # Calculate MAE for regression-like interpretation
-    # Convert to numeric if possible for MAE calculation
     try:
         mae = mean_absolute_error(
             pd.to_numeric(y_true, errors="coerce").fillna(0),
@@ -170,24 +184,18 @@ def _calculate_metrics(y_true: pd.Series, y_pred) -> dict[str, float]:
     }
 
 
-def _save_model_pkl(model: Any, model_name: str, metrics: dict) -> str:
-    """
-    Save model to .pkl file with metadata.
-    
-    Args:
-        model: Trained scikit-learn model.
-        model_name: Base name for the model file.
-        metrics: Dictionary of model metrics.
-        
-    Returns:
-        Path to saved model file.
-    """
+def _save_model_pkl(
+    model: Any, 
+    model_name: str, 
+    metrics: dict,
+    best_params: dict,
+) -> str:
+    """Save model to .pkl file with metadata."""
     import json
     
-    # Ensure models directory exists
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     
-    # Save model as .pkl
+    # Save model
     model_path = MODELS_DIR / f"{model_name}.pkl"
     joblib.dump(model, model_path)
     
@@ -196,6 +204,7 @@ def _save_model_pkl(model: Any, model_name: str, metrics: dict) -> str:
         "model_type": type(model).__name__,
         "model_file": f"{model_name}.pkl",
         "metrics": metrics,
+        "best_params": best_params,
     }
     
     if hasattr(model, "n_features_in_"):

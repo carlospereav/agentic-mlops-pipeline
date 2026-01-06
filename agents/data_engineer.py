@@ -2,6 +2,9 @@
 Data Engineer Agent for the MLOps pipeline.
 Responsible for data cleaning, handling nulls, and normalization.
 Uses different cleaning strategies when receiving negative feedback.
+
+NOTE: This agent only cleans data. Train/test split is done by Mathematician
+to allow for grid search, cross-validation, etc.
 """
 
 from typing import Any
@@ -9,7 +12,7 @@ from typing import Any
 from langchain_core.messages import AIMessage
 
 from state import AgentState
-from tools.data_tools import clean_null_values, load_csv_data, split_train_test
+from tools.data_tools import clean_null_values, load_csv_data
 
 
 # Available cleaning strategies to try on feedback
@@ -20,14 +23,14 @@ def data_engineer_node(state: AgentState) -> dict[str, Any]:
     """
     Data Engineer agent node - LangGraph compatible.
     
-    Processes raw data, handles nulls, and prepares train/test splits.
-    If receives negative feedback, tries a different cleaning strategy.
+    Loads and cleans data, then passes it to Mathematician.
+    Does NOT split data - that's the Mathematician's job for grid search flexibility.
     
     Args:
         state: Current AgentState with data_path and optional feedback.
         
     Returns:
-        Updated state dictionary with cleaned data and status.
+        Updated state with cleaned data ready for Mathematician.
     """
     messages = list(state.get("messages", []))
     feedback = state.get("feedback", "")
@@ -53,6 +56,7 @@ def data_engineer_node(state: AgentState) -> dict[str, Any]:
         # Step 1: Load the CSV data
         load_result = load_csv_data.invoke({"file_path": data_path})
         raw_data = load_result["data"]
+        columns = load_result["columns"]
         
         messages.append(AIMessage(
             content=f"[DataEngineer] Loaded {load_result['shape']['rows']} rows, "
@@ -62,14 +66,12 @@ def data_engineer_node(state: AgentState) -> dict[str, Any]:
         
         # Step 2: Clean null values with selected strategy
         if strategy == "drop":
-            # Drop rows with nulls instead of filling
             cleaned_data = _drop_null_rows(raw_data)
             messages.append(AIMessage(
                 content=f"[DataEngineer] Strategy 'drop': Removed rows with null values. "
                        f"Remaining rows: {len(cleaned_data)}"
             ))
         else:
-            # Use mean or median strategy
             clean_result = clean_null_values.invoke({
                 "data": raw_data,
                 "strategy": strategy,
@@ -84,40 +86,28 @@ def data_engineer_node(state: AgentState) -> dict[str, Any]:
                 ))
             else:
                 messages.append(AIMessage(
-                    content=f"[DataEngineer] No null values found. Data is clean."
+                    content="[DataEngineer] No null values found. Data is clean."
                 ))
         
-        # Step 3: Determine target column
-        columns = list(cleaned_data[0].keys()) if cleaned_data else []
+        # Step 3: Detect target column
         target_column = _detect_target_column(columns)
-        
-        # Step 4: Split into train/test
-        split_result = split_train_test.invoke({
-            "data": cleaned_data,
-            "target_column": target_column,
-            "test_size": 0.2,
-            "random_state": 42,
-        })
+        feature_columns = [c for c in columns if c != target_column]
         
         messages.append(AIMessage(
-            content=f"[DataEngineer] Data split complete. "
-                   f"Train: {split_result['split_info']['train_samples']} samples, "
-                   f"Test: {split_result['split_info']['test_samples']} samples. "
-                   f"Target: '{target_column}', Features: {split_result['feature_columns']}"
+            content=f"[DataEngineer] Data ready for Mathematician. "
+                   f"Samples: {len(cleaned_data)}, "
+                   f"Features: {feature_columns}, "
+                   f"Target: '{target_column}'"
         ))
         
-        # Return updated state - pass data to next agent
+        # Return cleaned data - Mathematician will do the split
         return {
             "messages": messages,
             "status": "cleaned",
-            "feedback": "",  # Clear feedback after processing
-            # Internal data for next agent (prefixed with _ to indicate internal use)
-            "_X_train": split_result["X_train"],
-            "_X_test": split_result["X_test"],
-            "_y_train": split_result["y_train"],
-            "_y_test": split_result["y_test"],
-            "_feature_columns": split_result["feature_columns"],
-            "_target_column": split_result["target_column"],
+            "feedback": "",
+            "_cleaned_data": cleaned_data,
+            "_target_column": target_column,
+            "_feature_columns": feature_columns,
             "_cleaning_strategy": strategy,
         }
         
@@ -142,17 +132,13 @@ def _count_cleaning_attempts(messages: list) -> int:
 
 
 def _detect_target_column(columns: list[str]) -> str:
-    """
-    Detect the target column from column names.
-    Looks for common target column names, defaults to last column.
-    """
+    """Detect the target column from column names."""
     common_targets = ["target", "label", "class", "y", "output", "prediction"]
     
     for col in columns:
         if col.lower() in common_targets:
             return col
     
-    # Default to last column
     return columns[-1] if columns else ""
 
 
