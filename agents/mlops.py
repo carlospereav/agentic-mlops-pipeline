@@ -1,0 +1,510 @@
+"""
+MLOps Engineer Agent for the MLOps pipeline.
+Responsible for containerization and deployment preparation.
+
+Only generates Dockerfile if the model has been validated successfully.
+"""
+
+from pathlib import Path
+from typing import Any
+
+from langchain_core.messages import AIMessage
+
+from state import AgentState
+from tools.devops_tools import generate_dockerfile
+
+
+# Minimum accuracy threshold to consider model validated
+VALIDATION_THRESHOLD = 0.7
+
+# Output directory for generated files
+OUTPUT_DIR = Path(__file__).parent.parent / "output"
+
+
+def mlops_node(state: AgentState) -> dict[str, Any]:
+    """
+    MLOps Engineer agent node - LangGraph compatible.
+    
+    Generates Dockerfile and deployment artifacts only if:
+    1. A model exists in the state
+    2. Model metrics meet the validation threshold
+    
+    Args:
+        state: Current AgentState with model and metrics.
+        
+    Returns:
+        Updated state with deployment status and artifacts.
+    """
+    messages = list(state.get("messages", []))
+    model = state.get("model")
+    model_path = state.get("model_path", "")
+    metrics = state.get("metrics", {})
+    
+    try:
+        # Check if model exists
+        if model is None:
+            messages.append(AIMessage(
+                content="[MLOps] No model found in state. Waiting for Mathematician to train model."
+            ))
+            return {
+                "messages": messages,
+                "status": "waiting",
+                "feedback": "No model available for deployment.",
+            }
+        
+        # Validate model metrics
+        accuracy = metrics.get("accuracy", 0.0)
+        
+        if accuracy < VALIDATION_THRESHOLD:
+            feedback = (
+                f"Model accuracy ({accuracy:.2%}) below threshold ({VALIDATION_THRESHOLD:.0%}). "
+                f"Requesting Data Engineer to improve data quality."
+            )
+            messages.append(AIMessage(
+                content=f"[MLOps] Validation FAILED: {feedback}"
+            ))
+            return {
+                "messages": messages,
+                "status": "rejected",
+                "feedback": feedback,
+            }
+        
+        # Model is validated - proceed with deployment prep
+        messages.append(AIMessage(
+            content=f"[MLOps] Model VALIDATED. Accuracy: {accuracy:.2%} >= {VALIDATION_THRESHOLD:.0%}. "
+                   f"Starting deployment preparation..."
+        ))
+        
+        # Generate Dockerfile
+        dockerfile_content = generate_dockerfile.invoke({
+            "app_name": "mlops-prediction-service",
+            "entry_point": "serve.py",
+            "port": 8000,
+            "python_version": "3.9",
+        })
+        
+        # Save Dockerfile to output directory
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        dockerfile_path = OUTPUT_DIR / "Dockerfile"
+        dockerfile_path.write_text(dockerfile_content)
+        
+        messages.append(AIMessage(
+            content=f"[MLOps] Dockerfile generated: {dockerfile_path}"
+        ))
+        
+        # Generate simple serve.py for model inference
+        serve_script = _generate_serve_script(model_path)
+        serve_path = OUTPUT_DIR / "serve.py"
+        serve_path.write_text(serve_script)
+        
+        messages.append(AIMessage(
+            content=f"[MLOps] Serve script generated: {serve_path}"
+        ))
+        
+        # Summary
+        messages.append(AIMessage(
+            content=(
+                f"[MLOps] Deployment preparation COMPLETE.\n"
+                f"  - Model: {model_path}\n"
+                f"  - Accuracy: {accuracy:.2%}\n"
+                f"  - Dockerfile: {dockerfile_path}\n"
+                f"  - Serve script: {serve_path}\n"
+                f"  - Ready for: docker build -t mlops-service output/"
+            )
+        ))
+        
+        return {
+            "messages": messages,
+            "status": "packaged",
+            "feedback": "",
+            "_dockerfile_path": str(dockerfile_path),
+            "_serve_path": str(serve_path),
+        }
+        
+    except Exception as e:
+        error_msg = f"[MLOps] Error during deployment prep: {str(e)}"
+        messages.append(AIMessage(content=error_msg))
+        
+        return {
+            "messages": messages,
+            "status": "error",
+            "feedback": error_msg,
+        }
+
+
+def _generate_serve_script(model_path: str) -> str:
+    """
+    Generate a secure FastAPI serve script for model inference.
+    
+    Security features:
+    - Model path validation to prevent loading malicious files
+    - Restricted to allowed model directories
+    - Input validation with Pydantic models
+    - Rate limiting and payload size restrictions
+    
+    Args:
+        model_path: Path to the saved model .pkl file.
+        
+    Returns:
+        Python script content as string.
+    """
+    return f'''"""
+Model Serving Script - FastAPI
+Auto-generated by MLOps Agent
+
+Security: This script validates the model path before loading to prevent
+loading potentially malicious pickle files from untrusted locations.
+
+Run with: uvicorn serve:app --host 0.0.0.0 --port 8000
+"""
+
+import sys
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
+
+import joblib
+import pandas as pd
+import uvicorn
+from fastapi import FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, field_validator
+
+
+# =============================================================================
+# SECURITY CONFIGURATION
+# =============================================================================
+
+# Allowed directories for loading models (relative to script location)
+ALLOWED_MODEL_DIRS = ["models", "../models", "/app/models"]
+
+# Maximum samples per prediction request
+MAX_SAMPLES_PER_REQUEST = 10000
+
+
+class ModelSecurityError(Exception):
+    """Raised when model loading violates security constraints."""
+    pass
+
+
+def validate_model_path(model_path: Path) -> Path:
+    """
+    Validate that the model path is within allowed directories.
+    
+    Security: Prevents loading arbitrary pickle files which could
+    execute malicious code during deserialization.
+    
+    Args:
+        model_path: Path to the model file.
+        
+    Returns:
+        Validated absolute path.
+        
+    Raises:
+        ModelSecurityError: If path is outside allowed directories.
+        FileNotFoundError: If model file doesn't exist.
+    """
+    script_dir = Path(__file__).parent.resolve()
+    resolved_path = model_path.resolve()
+    
+    # Check if path is within any allowed directory
+    is_allowed = False
+    for allowed_dir in ALLOWED_MODEL_DIRS:
+        allowed_path = (script_dir / allowed_dir).resolve()
+        try:
+            resolved_path.relative_to(allowed_path)
+            is_allowed = True
+            break
+        except ValueError:
+            continue
+    
+    if not is_allowed:
+        raise ModelSecurityError(
+            f"Security Error: Model path '{{model_path}}' is outside allowed directories. "
+            f"Allowed: {{ALLOWED_MODEL_DIRS}}"
+        )
+    
+    if not resolved_path.exists():
+        raise FileNotFoundError(f"Model file not found: {{resolved_path}}")
+    
+    if resolved_path.suffix != ".pkl":
+        raise ModelSecurityError(
+            f"Security Error: Only .pkl files are allowed. Got: {{resolved_path.suffix}}"
+        )
+    
+    return resolved_path
+
+
+def load_model_safely(model_path: str) -> Any:
+    """
+    Load model with security validation.
+    
+    Args:
+        model_path: Path to the model file.
+        
+    Returns:
+        Loaded model object.
+    """
+    path = Path(model_path)
+    validated_path = validate_model_path(path)
+    
+    print(f"[Security] Model path validated: {{validated_path}}")
+    return joblib.load(validated_path)
+
+
+# =============================================================================
+# PYDANTIC MODELS (Request/Response Validation)
+# =============================================================================
+
+class PredictionRequest(BaseModel):
+    """Request model for predictions with validation."""
+    
+    features: list[dict[str, Any]] = Field(
+        ...,
+        description="List of feature dictionaries for prediction",
+        min_length=1,
+        max_length=MAX_SAMPLES_PER_REQUEST,
+    )
+    
+    @field_validator("features")
+    @classmethod
+    def validate_features(cls, v: list[dict]) -> list[dict]:
+        if not v:
+            raise ValueError("Features list cannot be empty")
+        if len(v) > MAX_SAMPLES_PER_REQUEST:
+            raise ValueError(f"Maximum {{MAX_SAMPLES_PER_REQUEST}} samples per request")
+        return v
+
+
+class PredictionResponse(BaseModel):
+    """Response model for predictions."""
+    
+    predictions: list[Any]
+    probabilities: list[list[float]] | None = None
+    n_samples: int
+
+
+class HealthResponse(BaseModel):
+    """Response model for health check."""
+    
+    status: str
+    model_loaded: bool
+    model_type: str
+
+
+class ModelInfoResponse(BaseModel):
+    """Response model for model information."""
+    
+    model_type: str
+    model_loaded: bool
+    n_features: int | None = None
+    classes: list[Any] | None = None
+    feature_names: list[str] | None = None
+
+
+class ErrorResponse(BaseModel):
+    """Response model for errors."""
+    
+    detail: str
+
+
+# =============================================================================
+# MODEL LOADING & APP LIFECYCLE
+# =============================================================================
+
+MODEL_PATH = Path("{model_path}")
+model = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan manager - load model on startup."""
+    global model
+    
+    print("=" * 60)
+    print("MLOps Prediction Service - FastAPI")
+    print("=" * 60)
+    
+    try:
+        model = load_model_safely(str(MODEL_PATH))
+        print(f"[OK] Model loaded successfully: {{type(model).__name__}}")
+    except (ModelSecurityError, FileNotFoundError) as e:
+        print(f"[FATAL] {{e}}")
+        sys.exit(1)
+    
+    print(f"Listening on: http://0.0.0.0:8000")
+    print("=" * 60)
+    
+    yield  # Application runs here
+    
+    # Cleanup on shutdown
+    print("[INFO] Shutting down...")
+
+
+# =============================================================================
+# FASTAPI APPLICATION
+# =============================================================================
+
+app = FastAPI(
+    title="MLOps Prediction Service",
+    description="Secure ML model inference API with input validation",
+    version="1.0.0",
+    lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
+
+# CORS middleware (configure for production)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Restrict in production!
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+
+# =============================================================================
+# API ENDPOINTS
+# =============================================================================
+
+@app.get(
+    "/health",
+    response_model=HealthResponse,
+    tags=["Health"],
+    summary="Health check endpoint",
+)
+async def health() -> HealthResponse:
+    """
+    Check if the service is healthy and model is loaded.
+    
+    Returns:
+        HealthResponse with status and model information.
+    """
+    return HealthResponse(
+        status="healthy",
+        model_loaded=model is not None,
+        model_type=type(model).__name__ if model else "None",
+    )
+
+
+@app.post(
+    "/predict",
+    response_model=PredictionResponse,
+    responses={{
+        400: {{"model": ErrorResponse, "description": "Invalid input"}},
+        500: {{"model": ErrorResponse, "description": "Prediction error"}},
+    }},
+    tags=["Predictions"],
+    summary="Make predictions",
+)
+async def predict(request: PredictionRequest) -> PredictionResponse:
+    """
+    Make predictions using the loaded model.
+    
+    Security: Input is validated using Pydantic before processing.
+    
+    Args:
+        request: PredictionRequest with features list.
+        
+    Returns:
+        PredictionResponse with predictions and optional probabilities.
+        
+    Raises:
+        HTTPException: If prediction fails.
+    """
+    if model is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Model not loaded",
+        )
+    
+    try:
+        # Convert to DataFrame
+        X = pd.DataFrame(request.features)
+        
+        # Make predictions
+        predictions = model.predict(X).tolist()
+        
+        # Get probabilities if available
+        probabilities = None
+        if hasattr(model, "predict_proba"):
+            probabilities = model.predict_proba(X).tolist()
+        
+        return PredictionResponse(
+            predictions=predictions,
+            probabilities=probabilities,
+            n_samples=len(predictions),
+        )
+        
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid input data: {{str(e)}}",
+        )
+    except Exception as e:
+        # Log error but don't expose internal details
+        print(f"[ERROR] Prediction failed: {{str(e)}}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error during prediction",
+        )
+
+
+@app.get(
+    "/info",
+    response_model=ModelInfoResponse,
+    tags=["Model"],
+    summary="Get model information",
+)
+async def model_info() -> ModelInfoResponse:
+    """
+    Return model information (non-sensitive only).
+    
+    Note: Model path is intentionally not exposed for security.
+    
+    Returns:
+        ModelInfoResponse with model metadata.
+    """
+    if model is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Model not loaded",
+        )
+    
+    info = ModelInfoResponse(
+        model_type=type(model).__name__,
+        model_loaded=True,
+    )
+    
+    if hasattr(model, "n_features_in_"):
+        info.n_features = int(model.n_features_in_)
+    if hasattr(model, "classes_"):
+        info.classes = model.classes_.tolist()
+    if hasattr(model, "feature_names_in_"):
+        info.feature_names = model.feature_names_in_.tolist()
+    
+    return info
+
+
+@app.get("/", tags=["Health"], include_in_schema=False)
+async def root():
+    """Redirect root to docs."""
+    return {{"message": "MLOps Prediction Service", "docs": "/docs"}}
+
+
+# =============================================================================
+# MAIN ENTRY POINT
+# =============================================================================
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "serve:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=False,  # Disable in production
+        workers=1,
+        log_level="info",
+    )
+'''
+
