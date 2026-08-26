@@ -42,6 +42,8 @@ class AgentState(TypedDict, total=False):
     _feature_columns: list[str]
     _target_column: str
     _cleaning_strategy: str
+    _label_encoders: dict  # LabelEncoders for categorical columns
+    _categorical_columns: list[str]
     _best_params: dict
     _cv_score: float
     _dockerfile_path: str

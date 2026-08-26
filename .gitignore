@@ -264,3 +264,7 @@ wandb/
 # Experiment tracking
 experiments/
 runs/
+
+# Generated output files (may contain local paths)
+output/
+!output/.gitkeep
